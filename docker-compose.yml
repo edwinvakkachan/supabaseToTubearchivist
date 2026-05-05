@@ -1,0 +1,10 @@
+services:
+  supabasetubesync:
+    build: .
+    container_name: supabasetubesync   
+    restart: unless-stopped
+    environment:
+      API_TOKEN: ${API_TOKEN}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      TUBE_API_URL:  ${TUBE_API_URL}
