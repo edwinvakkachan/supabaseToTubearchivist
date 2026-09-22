@@ -1,79 +1,55 @@
-require('dotenv').config();
+import dotenv from 'dotenv'
+dotenv.config();
+import axios from 'axios';
+import { initDB } from './supabase/db.js';
+import pool from './supabase/pool.js';
+import { delay } from './delay.js';
 
-const axios = require('axios');
-const { createClient } = require('@supabase/supabase-js');
-
-// ---------- Logging ----------
-const TZ = 'Asia/Kolkata';
-
-const ts = () =>
-  new Date().toLocaleString('en-IN', {
-    timeZone: TZ,
-    hour12: false,
-  });
-
-const log = (...args) => console.log(`[${ts()}]`, ...args);
-const warn = (...args) => console.warn(`[${ts()}] ⚠️`, ...args);
-const err = (...args) => console.error(`[${ts()}] ❌`, ...args);
-
-// ---------- Helpers ----------
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 // ---------- Env ----------
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const API_TOKEN = process.env.API_TOKEN;
 const TUBE_API_URL = process.env.TUBE_API_URL;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !API_TOKEN || !TUBE_API_URL) {
-  err('Missing required env vars');
-  process.exit(1);
-}
 
-// ---------- Clients ----------
-const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY
-);
+
+
 
 // ---------- Main Worker ----------
 async function processQueue() {
-  log('Starting queue worker...');
+  console.log('Starting queue worker...');
 
   while (true) {
     try {
-      const { data: items, error } = await supabase
-        .from('youtube_queue')
-        .select('*')
-        .eq('status', 'pending')
-        .order('created_at', { ascending: true })
-        .limit(50);
-
-      if (error) {
-        err('Failed to fetch queue:', error.message);
-        await sleep(10000);
-        continue;
-      }
+      await initDB();
+      
+      const { rows: items } = await pool.query(`
+    SELECT *
+    FROM youtube_queue
+    WHERE status = 'pending'
+    ORDER BY created_at ASC
+    LIMIT 50
+`);
 
       if (!items || items.length === 0) {
-        log('Queue empty...');
-        await sleep(5000);
+         console.log('Queue empty...');
+        await delay(60000);
         continue;
       }
 
-      log(`Found ${items.length} pending item(s)`);
+       console.log(`Found ${items.length} pending item(s)`);
 
       for (const item of items) {
         try {
           // Mark processing first
-          await supabase
-            .from('youtube_queue')
-            .update({
-              status: 'processing',
-            })
-            .eq('id', item.id);
+try {
+    await pool.query(`
+        UPDATE youtube_queue
+        SET status = $1
+        WHERE id = $2
+    `, ['processing', item.id]);
+} catch (error) {
+    console.error('Error updating queue item:', error);
+}
 
           const payload = {
             data: [
@@ -84,7 +60,7 @@ async function processQueue() {
             ],
           };
 
-          log(`Sending ${item.youtube_id} to TubeArchivist...`);
+           console.log(`Sending ${item.youtube_id} to TubeArchivist...`);
 
           const res = await axios.post(
             TUBE_API_URL,
@@ -100,16 +76,18 @@ async function processQueue() {
           );
 
           if (res.status >= 200 && res.status < 300) {
-            log(`TubeArchivist accepted ${item.youtube_id}`);
+            console.log(`TubeArchivist accepted ${item.youtube_id}`);
 
-            await supabase
-              .from('youtube_queue')
-              .update({
-                status: 'sent',
-                sent_at: new Date().toISOString(),
-                error_message: null,
-              })
-              .eq('id', item.id);
+await pool.query(`
+    UPDATE youtube_queue
+    SET
+        status = 'sent',
+        sent_at = NOW(),
+        error_message = NULL
+    WHERE id = $1
+`, [item.id]);
+
+
           } else {
             throw new Error(`TubeArchivist returned ${res.status}`);
           }
@@ -124,41 +102,41 @@ async function processQueue() {
           if (errorMessage.toLowerCase().includes('already')) {
             warn(`${item.youtube_id} already exists in TubeArchivist`);
 
-            await supabase
-              .from('youtube_queue')
-              .update({
-                status: 'sent',
-                sent_at: new Date().toISOString(),
-                error_message: null,
-              })
-              .eq('id', item.id);
+await pool.query(`
+    UPDATE youtube_queue
+    SET
+        status = 'sent',
+        sent_at = NOW(),
+        error_message = NULL
+    WHERE id = $1
+`, [item.id]);
 
             continue;
           }
 
-          err(`Failed for ${item.youtube_id}:`, errorMessage);
+          console.error(`Failed for ${item.youtube_id}:`, errorMessage);
 
-          await supabase
-            .from('youtube_queue')
-            .update({
-              status: 'failed',
-              error_message: errorMessage,
-            })
-            .eq('id', item.id);
+    await pool.query(`
+    UPDATE youtube_queue
+    SET
+        status = 'failed',
+        error_message = $1
+    WHERE id = $2
+`, [errorMessage, item.id]);
         }
 
         // Small delay between requests
-        await sleep(3000);
+        await delay(3000);
       }
 
     } catch (e) {
-      err('Worker loop crashed:', e.message);
-      await sleep(10000);
+      console.error('Worker loop crashed:', e.message);
+      await delay(10000);
     }
   }
 }
 
 // ---------- Run ----------
 processQueue().catch((e) => {
-  err('Fatal worker crash:', e);
+  console.error('Fatal worker crash:', e);
 });
