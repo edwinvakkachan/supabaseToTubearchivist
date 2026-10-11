@@ -15,6 +15,9 @@ const REQUEST_DELAY_MS = 3000;
 const LOOP_DELAY_MS = 60000;
 const ERROR_DELAY_MS = 10000;
 
+const MAX_ATTEMPTS = 4;
+const RETRY_DELAY_SECONDS = 60;
+
 // ---------- Logging ----------
 
 function logError(context, error) {
@@ -37,9 +40,9 @@ async function runTask(name, task) {
   }
 }
 
-// ---------- Database status updates ----------
+// ---------- Queue status updates ----------
 
-async function updateQueueStatus(id, status, errorMessage = null) {
+async function updateQueueStatus(id, status) {
   if (status === "sent") {
     await pool.query(
       `UPDATE public.youtube_queue
@@ -49,24 +52,17 @@ async function updateQueueStatus(id, status, errorMessage = null) {
        WHERE id = $1`,
       [id]
     );
-    return;
   }
-
-  await pool.query(
-    `UPDATE public.youtube_queue
-     SET status = $1,
-         error_message = $2
-     WHERE id = $3`,
-    [status, errorMessage, id]
-  );
 }
 
 // ---------- Process one queue item ----------
 
 async function processItem(item) {
-  console.log(`\n🎬 Processing ${item.youtube_id} (ID: ${item.id})`);
+  console.log(
+    `\n🎬 Processing ${item.youtube_id} (ID: ${item.id})`
+  );
 
-  // If this fails, do not send the item without updating its state.
+  // Mark as processing before sending.
   try {
     await pool.query(
       `UPDATE public.youtube_queue
@@ -75,7 +71,10 @@ async function processItem(item) {
       [item.id]
     );
   } catch (error) {
-    logError(`Could not mark ${item.youtube_id} as processing`, error);
+    logError(
+      `Could not mark ${item.youtube_id} as processing`,
+      error
+    );
     return false;
   }
 
@@ -101,13 +100,16 @@ async function processItem(item) {
     );
 
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`TubeArchivist returned HTTP ${response.status}`);
+      throw new Error(
+        `TubeArchivist returned HTTP ${response.status}`
+      );
     }
 
-    console.log(`✅ TubeArchivist accepted ${item.youtube_id}`);
-
     await updateQueueStatus(item.id, "sent");
-    console.log(`📨 Queue item ${item.id} marked as sent`);
+
+    console.log(
+      `✅ ${item.youtube_id} accepted and marked as sent`
+    );
 
     return true;
   } catch (error) {
@@ -115,7 +117,7 @@ async function processItem(item) {
       ? JSON.stringify(error.response.data)
       : error.message || String(error);
 
-    // Treat "already exists" as successfully handled.
+    // Treat an already-existing video as successfully handled.
     if (errorMessage.toLowerCase().includes("already")) {
       console.warn(
         `⚠️ ${item.youtube_id} already exists in TubeArchivist`
@@ -126,7 +128,7 @@ async function processItem(item) {
         return true;
       } catch (dbError) {
         logError(
-          `Could not mark existing video ${item.youtube_id} as sent`,
+          `Could not mark ${item.youtube_id} as sent`,
           dbError
         );
         return false;
@@ -135,11 +137,40 @@ async function processItem(item) {
 
     logError(`Failed to process ${item.youtube_id}`, error);
 
+    // Increment retry count and mark for deletion after max attempts.
     try {
-      await updateQueueStatus(item.id, "failed", errorMessage);
+      const result = await pool.query(
+        `UPDATE public.youtube_queue
+         SET retry_count = COALESCE(retry_count, 0) + 1,
+             last_retry = NOW(),
+             status = CASE
+               WHEN COALESCE(retry_count, 0) + 1 >= $1
+                 THEN 'delete'
+               ELSE 'failed'
+             END,
+             error_message = $2
+         WHERE id = $3
+         RETURNING retry_count, status`,
+        [MAX_ATTEMPTS, errorMessage, item.id]
+      );
+
+      const updated = result.rows[0];
+
+      if (updated?.status === "delete") {
+        console.error(
+          `🗑️ ${item.youtube_id} reached ${MAX_ATTEMPTS} ` +
+          `failed attempts. Marked for deletion.`
+        );
+      } else if (updated) {
+        console.warn(
+          `🔁 ${item.youtube_id}: attempt ` +
+          `${updated.retry_count}/${MAX_ATTEMPTS}. ` +
+          `Retry after ${RETRY_DELAY_SECONDS} seconds.`
+        );
+      }
     } catch (dbError) {
       logError(
-        `Could not save failure status for ${item.youtube_id}`,
+        `Could not save retry information for ${item.youtube_id}`,
         dbError
       );
     }
@@ -148,7 +179,7 @@ async function processItem(item) {
   }
 }
 
-// ---------- Main Worker ----------
+// ---------- Main worker ----------
 
 async function processQueue() {
   console.log("\n======================================");
@@ -156,12 +187,13 @@ async function processQueue() {
   console.log("======================================");
 
   if (!API_TOKEN || !TUBE_API_URL) {
-    throw new Error("API_TOKEN or TUBE_API_URL is missing from .env");
+    throw new Error(
+      "API_TOKEN or TUBE_API_URL is missing from .env"
+    );
   }
 
   while (true) {
     try {
-      // A database initialization failure must not terminate the worker.
       const initialized = await runTask(
         "Initialize database",
         () => initDB()
@@ -176,32 +208,49 @@ async function processQueue() {
 
       try {
         const result = await pool.query(
-          `SELECT id, youtube_id, status, created_at
+          `SELECT id, youtube_id, status, created_at,
+                  retry_count, last_retry
            FROM public.youtube_queue
-           WHERE status = 'pending'
+           WHERE
+             status = 'pending'
+             OR (
+               status = 'failed'
+               AND COALESCE(retry_count, 0) < $1
+               AND (
+                 last_retry IS NULL
+                 OR last_retry <= NOW()
+                    - ($2 * INTERVAL '1 second')
+               )
+             )
            ORDER BY created_at ASC
-           LIMIT $1`,
-          [BATCH_SIZE]
+           LIMIT $3`,
+          [
+            MAX_ATTEMPTS,
+            RETRY_DELAY_SECONDS,
+            BATCH_SIZE,
+          ]
         );
 
         items = result.rows;
       } catch (error) {
-        logError("Could not fetch pending queue items", error);
+        logError("Could not fetch queue items", error);
         await delay(ERROR_DELAY_MS);
         continue;
       }
 
       if (items.length === 0) {
-        console.log("📭 Queue empty...");
+        console.log("📭 No pending or retryable items");
       } else {
-        console.log(`📋 Found ${items.length} pending item(s)`);
+        console.log(`📋 Found ${items.length} queue item(s)`);
 
         for (const item of items) {
-          // One item's failure does not stop the remaining items.
           try {
             await processItem(item);
           } catch (error) {
-            logError(`Unexpected error for queue ID ${item.id}`, error);
+            logError(
+              `Unexpected error for queue ID ${item.id}`,
+              error
+            );
           }
 
           try {
@@ -212,7 +261,7 @@ async function processQueue() {
         }
       }
 
-      // Cleanup is independent of queue processing.
+      // Cleanup runs even when individual queue items fail.
       await runTask(
         "Delete old sent YouTube queue rows",
         () => deleteOldSentYouTubeQueue()
@@ -220,7 +269,6 @@ async function processQueue() {
 
       await delay(LOOP_DELAY_MS);
     } catch (error) {
-      // Recover from unexpected errors and continue the worker loop.
       logError("Unexpected worker-loop error", error);
 
       try {
