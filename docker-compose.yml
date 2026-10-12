@@ -2,7 +2,7 @@ services:
   supabasetubesync:
     build: .
     container_name: supabasetubesync   
-    restart: no
+    restart: always
     environment:
       API_TOKEN: ${API_TOKEN}
       DATABASE_URL: ${DATABASE_URL}
