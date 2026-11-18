@@ -18,6 +18,8 @@ const BATCH_SIZE = 50;
 const REQUEST_DELAY_MS = 3000;
 const LOOP_DELAY_MS = 60000;
 const ERROR_DELAY_MS = 10000;
+const SUBSCRIPTION_VERIFY_TIMEOUT_MS = 60000;
+const SUBSCRIPTION_VERIFY_INTERVAL_MS = 3000;
 
 const MAX_ATTEMPTS = 4;
 const RETRY_DELAY_SECONDS = 60;
@@ -312,6 +314,146 @@ async function processItem(item) {
   }
 }
 
+// ---------- TubeArchivist channel subscriptions ----------
+
+function getChannelApiUrl(channelId) {
+  const baseUrl = new URL(TUBE_API_URL);
+  return new URL(`/api/channel/${encodeURIComponent(channelId)}/`, baseUrl).toString();
+}
+
+async function waitForSubscriptionState(item) {
+  const expectedState = item.action === "subscribe";
+  const deadline = Date.now() + SUBSCRIPTION_VERIFY_TIMEOUT_MS;
+  let lastError;
+
+  while (Date.now() < deadline) {
+    try {
+      const response = await axios.get(getChannelApiUrl(item.channel_id), {
+        headers: { Authorization: `Token ${API_TOKEN}`, Accept: "application/json" },
+        timeout: 15000,
+        validateStatus: (status) => status === 200 || status === 404,
+      });
+
+      if (response.status === 200 && response.data?.channel_subscribed === expectedState) {
+        return;
+      }
+      if (response.status === 404 && !expectedState) {
+        // An absent channel is already unsubscribed.
+        return;
+      }
+      lastError = new Error(`TubeArchivist has not applied ${item.action} yet`);
+    } catch (error) {
+      lastError = error;
+    }
+    await delay(SUBSCRIPTION_VERIFY_INTERVAL_MS);
+  }
+
+  throw lastError || new Error(`Timed out waiting for channel ${item.channel_id} to ${item.action}`);
+}
+
+async function processSubscriptionItem(item) {
+  const subscribe = item.action === "subscribe";
+  console.log(`\n📡 ${item.action} channel ${item.channel_id} for chat ${item.chat_id}`);
+
+  try {
+    if (subscribe) {
+      await axios.post(
+        new URL("/api/channel/", TUBE_API_URL).toString(),
+        { data: [{ channel_id: item.channel_id, channel_subscribed: true }] },
+        {
+          headers: {
+            Authorization: `Token ${API_TOKEN}`,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          timeout: 30000,
+        }
+      );
+    } else {
+      const response = await axios.post(
+        getChannelApiUrl(item.channel_id),
+        { channel_subscribed: false },
+        {
+          headers: {
+            Authorization: `Token ${API_TOKEN}`,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          timeout: 30000,
+          validateStatus: (status) => (status >= 200 && status < 300) || status === 404,
+        }
+      );
+      if (response.status === 404) {
+        // TubeArchivist has no indexed channel to unsubscribe.
+        await pool.query(
+          `DELETE FROM public.youtube_channel_subscriptions
+           WHERE chat_id = $1 AND channel_id = $2`,
+          [item.chat_id, item.channel_id]
+        );
+        console.log(`✅ Channel ${item.channel_id} is absent; removed unsubscribe request`);
+        return;
+      }
+    }
+
+    // TubeArchivist queues subscribe jobs asynchronously, so only remove the
+    // Supabase request after its channel state reflects the requested action.
+    await waitForSubscriptionState(item);
+    await pool.query(
+      `DELETE FROM public.youtube_channel_subscriptions
+       WHERE chat_id = $1 AND channel_id = $2`,
+      [item.chat_id, item.channel_id]
+    );
+    console.log(`✅ ${item.action} completed; removed subscription request ${item.channel_id}`);
+  } catch (error) {
+    logError(`Could not ${item.action} channel ${item.channel_id}`, error);
+    await pool.query(
+      `UPDATE public.youtube_channel_subscriptions
+       SET status = 'pending'
+       WHERE chat_id = $1 AND channel_id = $2`,
+      [item.chat_id, item.channel_id]
+    ).catch((dbError) => logError(`Could not reset subscription request ${item.channel_id}`, dbError));
+  }
+}
+
+async function processSubscriptionQueue() {
+  const result = await pool.query(
+    `WITH claimed AS (
+       SELECT chat_id, channel_id
+       FROM public.youtube_channel_subscriptions
+       WHERE status = 'pending'
+       ORDER BY created_at ASC
+       LIMIT $1
+       FOR UPDATE SKIP LOCKED
+     )
+     UPDATE public.youtube_channel_subscriptions AS q
+     SET status = 'processing'
+     FROM claimed
+     WHERE q.chat_id = claimed.chat_id AND q.channel_id = claimed.channel_id
+     RETURNING q.chat_id, q.channel_id, q.channel_url, q.action, q.status`,
+    [BATCH_SIZE]
+  );
+
+  if (result.rows.length === 0) {
+    console.log("📭 No pending channel subscription requests");
+    return;
+  }
+
+  console.log(`📋 Found ${result.rows.length} channel subscription request(s)`);
+  for (const item of result.rows) {
+    if (!["subscribe", "unsubscribe"].includes(item.action)) {
+      console.error(`Unsupported subscription action '${item.action}' for ${item.channel_id}; request left in queue`);
+      await pool.query(
+        `UPDATE public.youtube_channel_subscriptions SET status = 'failed'
+         WHERE chat_id = $1 AND channel_id = $2`,
+        [item.chat_id, item.channel_id]
+      );
+      continue;
+    }
+    await processSubscriptionItem(item);
+    await delay(REQUEST_DELAY_MS);
+  }
+}
+
 // ---------- Main worker ----------
 
 async function processQueue() {
@@ -393,6 +535,8 @@ async function processQueue() {
           }
         }
       }
+
+      await runTask("Process channel subscription queue", () => processSubscriptionQueue());
 
       // MongoDB work is independent; failures do not interrupt Supabase processing.
       await processMongoQueue();
