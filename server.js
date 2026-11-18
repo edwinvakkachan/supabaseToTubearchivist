@@ -1,6 +1,7 @@
 
 import "dotenv/config";
 import axios from "axios";
+import { MongoClient } from "mongodb";
 
 import { initDB } from "./supabase/db.js";
 import pool from "./supabase/pool.js";
@@ -9,6 +10,9 @@ import { deleteOldSentYouTubeQueue } from "./supabase/deleteOldSentYouTubeQueue.
 
 const API_TOKEN = process.env.API_TOKEN;
 const TUBE_API_URL = process.env.TUBE_API_URL;
+const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_DATABASE = process.env.MONGODB_DATABASE || "test";
+const MONGODB_COLLECTION = process.env.MONGODB_COLLECTION || "youtubeque";
 
 const BATCH_SIZE = 50;
 const REQUEST_DELAY_MS = 3000;
@@ -17,6 +21,8 @@ const ERROR_DELAY_MS = 10000;
 
 const MAX_ATTEMPTS = 4;
 const RETRY_DELAY_SECONDS = 60;
+
+let mongoClient;
 
 // ---------- Logging ----------
 
@@ -52,6 +58,133 @@ async function updateQueueStatus(id, status) {
        WHERE id = $1`,
       [id]
     );
+  }
+}
+
+async function getMongoQueue() {
+  if (!MONGODB_URI) return null;
+  if (!mongoClient) {
+    mongoClient = new MongoClient(MONGODB_URI);
+    await mongoClient.connect();
+    console.log(`✅ MongoDB connected (${MONGODB_DATABASE}.${MONGODB_COLLECTION})`);
+  }
+  return mongoClient.db(MONGODB_DATABASE).collection(MONGODB_COLLECTION);
+}
+
+async function processMongoItem(collection, item) {
+  const youtubeId = item.youtubeId;
+  console.log(`\n🎬 Processing MongoDB ${youtubeId} (ID: ${item._id})`);
+
+  try {
+    await collection.updateOne(
+      { _id: item._id, status: { $in: ["PENDING", "FAILED"] } },
+      { $set: { status: "PROCESSING", updatedAt: new Date() } }
+    );
+
+    const response = await axios.post(
+      TUBE_API_URL,
+      { data: [{ youtube_id: youtubeId, status: "pending" }] },
+      {
+        headers: {
+          Authorization: `Token ${API_TOKEN}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        timeout: 30000,
+      }
+    );
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`TubeArchivist returned HTTP ${response.status}`);
+    }
+
+    await collection.updateOne(
+      { _id: item._id },
+      {
+        $set: {
+          status: "SENT",
+          processedAt: new Date(),
+          updatedAt: new Date(),
+          lastError: "",
+        },
+      }
+    );
+    console.log(`✅ ${youtubeId} accepted and marked as SENT in MongoDB`);
+    return true;
+  } catch (error) {
+    const errorMessage = error.response?.data
+      ? JSON.stringify(error.response.data)
+      : error.message || String(error);
+
+    if (errorMessage.toLowerCase().includes("already")) {
+      try {
+        await collection.updateOne(
+          { _id: item._id },
+          {
+            $set: {
+              status: "SENT",
+              processedAt: new Date(),
+              updatedAt: new Date(),
+              lastError: "",
+            },
+          }
+        );
+        console.warn(`⚠️ ${youtubeId} already exists in TubeArchivist; marked SENT`);
+        return true;
+      } catch (dbError) {
+        logError(`Could not mark MongoDB item ${youtubeId} as SENT`, dbError);
+        return false;
+      }
+    }
+
+    logError(`Failed to process MongoDB item ${youtubeId}`, error);
+    try {
+      const retryCount = (item.retryCount || 0) + 1;
+      await collection.updateOne(
+        { _id: item._id },
+        {
+          $set: {
+            retryCount,
+            lastError: errorMessage,
+            status: retryCount >= (item.maxRetries || MAX_ATTEMPTS) ? "FAILED" : "PENDING",
+            updatedAt: new Date(),
+          },
+        }
+      );
+    } catch (dbError) {
+      logError(`Could not save retry information for MongoDB item ${youtubeId}`, dbError);
+    }
+    return false;
+  }
+}
+
+async function processMongoQueue() {
+  if (!MONGODB_URI) return;
+
+  try {
+    const collection = await getMongoQueue();
+    const items = await collection
+      .find({ status: "PENDING", youtubeId: { $type: "string", $ne: "" } })
+      .sort({ createdAt: 1 })
+      .limit(BATCH_SIZE)
+      .toArray();
+
+    if (items.length === 0) {
+      console.log("📭 No pending MongoDB items");
+      return;
+    }
+    console.log(`📋 Found ${items.length} MongoDB queue item(s)`);
+    for (const item of items) {
+      await processMongoItem(collection, item);
+      await delay(REQUEST_DELAY_MS);
+    }
+  } catch (error) {
+    logError("Could not process MongoDB queue", error);
+    // Allow a later loop to reconnect after transient network failures.
+    if (mongoClient) {
+      await mongoClient.close().catch(() => {});
+      mongoClient = null;
+    }
   }
 }
 
@@ -260,6 +393,9 @@ async function processQueue() {
           }
         }
       }
+
+      // MongoDB work is independent; failures do not interrupt Supabase processing.
+      await processMongoQueue();
 
       // Cleanup runs even when individual queue items fail.
       await runTask(
